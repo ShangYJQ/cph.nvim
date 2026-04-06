@@ -56,6 +56,10 @@ local function get_tests()
 	tests = vim.json.decode(content)
 end
 
+local function set_tests_ui()
+	get_tests()
+end
+
 local function set_creat_ui()
 	in_create_ui = true
 	lines = (function()
@@ -124,29 +128,11 @@ local function build_lines()
 		set_creat_ui()
 	else
 		in_create_ui = false
-		get_tests()
-		lines = {
-			file_path,
-			vim.fn.fnamemodify(file_path, ":f"),
-			vim.fn.fnamemodify(file_path, ":e"),
-			config.compile["cpp"].compiler
-		}
+		set_tests_ui()
 	end
 end
 
-
-local function ensure_buf()
-	if buf and vim.api.nvim_buf_is_valid(buf) then
-		return buf
-	end
-
-	buf = vim.api.nvim_create_buf(false, true)
-
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "hide"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].filetype = "cph-tree"
-
+local function set_keymaps()
 	vim.keymap.set("n", "q", function()
 		M.close()
 	end, { buffer = buf, silent = true })
@@ -162,6 +148,22 @@ local function ensure_buf()
 			M.refresh()
 		end
 	end, { buffer = buf, silent = true })
+end
+
+
+local function ensure_buf()
+	if buf and vim.api.nvim_buf_is_valid(buf) then
+		return buf
+	end
+
+	buf = vim.api.nvim_create_buf(false, true)
+
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "hide"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "cph-tree"
+
+	set_keymaps()
 end
 
 function M.render()
