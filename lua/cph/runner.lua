@@ -6,6 +6,7 @@
 ---@field mem_limit integer
 ---@field passed string
 ---@field selected boolean
+---@field collapsed boolean
 ---@field runtime_ms integer|nil
 
 local executor = require("cph.executor")
@@ -31,6 +32,7 @@ local edit_sync_pending = false
 
 local lines = {}
 local line_meta = {}
+local test_layouts = {}
 local selected_test_indexes = {}
 local selected_count = 0
 
@@ -39,10 +41,6 @@ local tests = {}
 
 ---@type integer
 local current = 1
----@type integer
-local current_test_row = 1
----@type integer
-local current_test_end_row = 1
 ---@type string
 local file_path = ""
 ---@type string
@@ -76,6 +74,7 @@ local function normalize_test(test)
 	test.real_output = test.real_output or ""
 	test.passed = test.passed or STATUS_IDLE
 	test.selected = test.selected or false
+	test.collapsed = test.collapsed or false
 	test.time_limit = test.time_limit or config.run.time_limit
 	test.mem_limit = test.mem_limit or config.run.memory_limit
 	test.runtime_ms = test.runtime_ms
@@ -121,6 +120,7 @@ local function write_tests_for(target_file_path, items)
 			mem_limit = test.mem_limit,
 			passed = test.passed,
 			selected = test.selected,
+			collapsed = test.collapsed,
 			runtime_ms = test.runtime_ms,
 		}
 	end
@@ -170,6 +170,7 @@ local function create_test_template()
 		mem_limit = config.run.memory_limit,
 		passed = STATUS_IDLE,
 		selected = false,
+		collapsed = false,
 		runtime_ms = nil,
 	}
 end
@@ -198,11 +199,6 @@ local function add_test()
 	M.refresh()
 end
 
-local function align_line(left, right, width)
-	local pad = width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(right)
-	return left .. string.rep(" ", math.max(1, pad)) .. right
-end
-
 local function escape_statusline(text)
 	return text:gsub("%%", "%%%%")
 end
@@ -218,6 +214,24 @@ local function split_text(text)
 	})
 end
 
+local function normalize_expected_text(text)
+	text = text or ""
+	text = text:gsub("\r\n", "\n")
+	text = text:gsub("\r", "\n")
+
+	local normalized = {}
+	for _, line in ipairs(split_text(text)) do
+		line = line:gsub("%s+", " ")
+		line = vim.trim(line)
+
+		if line ~= "" then
+			normalized[#normalized + 1] = line
+		end
+	end
+
+	return table.concat(normalized, "\n")
+end
+
 local function join_lines(input_lines)
 	return table.concat(input_lines, "\n")
 end
@@ -227,9 +241,58 @@ local function push_line(text, meta)
 	line_meta[#lines] = meta or {}
 end
 
-local function append_text_block(text)
-	for _, line in ipairs(split_text(text or "")) do
-		push_line(line)
+local function push_test_line(index, text, meta)
+	meta = meta or {}
+	meta.test_index = index
+	push_line(text, meta)
+end
+
+local function trim_display_text(text, max_width)
+	max_width = math.max(1, max_width)
+	if vim.fn.strdisplaywidth(text) <= max_width then
+		return text
+	end
+
+	local trimmed = text
+	while trimmed ~= "" and vim.fn.strdisplaywidth(trimmed .. "...") > max_width do
+		local length = vim.fn.strchars(trimmed)
+		trimmed = vim.fn.strcharpart(trimmed, 0, math.max(0, length - 1))
+	end
+
+	if trimmed == "" then
+		return "..."
+	end
+
+	return trimmed .. "..."
+end
+
+local function build_preview(label, text, width)
+	local preview = (text or ""):gsub("\n", " \\n "):gsub("\t", "  "):gsub("^%s+", ""):gsub("%s+$", "")
+	local line_count = #split_text(text or "")
+
+	if preview == "" then
+		preview = "<empty>"
+	end
+
+	local suffix = line_count > 1 and string.format(" (%d lines)", line_count) or ""
+	local prefix = label .. ": "
+	local preview_width = width - vim.fn.strdisplaywidth(prefix) - vim.fn.strdisplaywidth(suffix) - 1
+	preview = trim_display_text(preview, math.max(12, preview_width))
+
+	return prefix .. preview .. suffix
+end
+
+local function append_labeled_block(index, label, text)
+	push_test_line(index, label .. ":", { kind = "label" })
+
+	local content_lines = split_text(text or "")
+	if #content_lines == 1 and content_lines[1] == "" then
+		push_test_line(index, "  <empty>", { kind = "empty" })
+		return
+	end
+
+	for _, line in ipairs(content_lines) do
+		push_test_line(index, "  " .. line, { kind = "content" })
 	end
 end
 
@@ -245,7 +308,8 @@ end
 
 local function set_tests_winbar()
 	local title = "File: " .. vim.fn.fnamemodify(file_path, ":t")
-	local summary = string.format("%d selected", selected_count)
+	local current_summary = #tests > 0 and string.format("%d/%d", current, #tests) or "0/0"
+	local summary = string.format("%s | %d selected", current_summary, selected_count)
 
 	if is_file_running() then
 		summary = summary .. " | running"
@@ -284,7 +348,22 @@ local function sync_edit_popup(field)
 		return
 	end
 
-	test[field] = join_lines(vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false))
+	local value = join_lines(vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false))
+	if field == "std_output" then
+		value = normalize_expected_text(value)
+		if edit_buf and vim.api.nvim_buf_is_valid(edit_buf) then
+			local normalized_lines = split_text(value)
+			local current_lines = vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false)
+			if not vim.deep_equal(current_lines, normalized_lines) then
+				edit_sync_pending = true
+				vim.bo[edit_buf].modifiable = true
+				vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, normalized_lines)
+				edit_sync_pending = false
+			end
+		end
+	end
+
+	test[field] = value
 	write_tests()
 	M.refresh()
 	if edit_win and vim.api.nvim_win_is_valid(edit_win) then
@@ -333,7 +412,10 @@ local function open_edit_popup(field, title)
 		title_pos = "center",
 	})
 
-	vim.wo[edit_win].wrap = false
+	vim.wo[edit_win].wrap = true
+	vim.wo[edit_win].linebreak = true
+	vim.wo[edit_win].breakindent = true
+	vim.wo[edit_win].showbreak = "  "
 	vim.wo[edit_win].number = false
 	vim.wo[edit_win].relativenumber = false
 	vim.wo[edit_win].signcolumn = "no"
@@ -415,11 +497,12 @@ local function apply_decorations()
 
 		if meta.kind == "heading" then
 			add_decoration("CphHeading", 0, -1)
-			if meta.selected then
-				add_decoration("CphSelectedBlock", 0, 2, 200)
-			end
-			if line:sub(-1) == ">" then
-				add_decoration("CphAccent", #line - 1, #line, 200)
+			add_decoration("CphAccent", 0, math.min(3, #line), 200)
+
+			local selected_start = line:find("%[selected%]")
+			if selected_start then
+				local start_col = selected_start - 1
+				add_decoration("CphSelected", start_col, start_col + #" [selected]" - 1, 200)
 			end
 		elseif meta.kind == "status" then
 			local prefix = "status: "
@@ -441,8 +524,16 @@ local function apply_decorations()
 				add_decoration("CphLabel", 0, prefix_end + 1)
 				add_decoration("CphMetric", prefix_end + 1, -1, 120)
 			end
+		elseif meta.kind == "preview" then
+			local prefix_end = line:find(": ", 1, true)
+			if prefix_end then
+				add_decoration("CphLabel", 0, prefix_end + 1)
+				add_decoration("CphMuted", prefix_end + 1, -1, 120)
+			end
 		elseif meta.kind == "label" then
 			add_decoration("CphLabel", 0, -1)
+		elseif meta.kind == "empty" then
+			add_decoration("CphMuted", 0, -1)
 		elseif not in_tests_ui and line ~= "" then
 			add_decoration("CphMuted", 0, -1)
 		end
@@ -455,8 +546,6 @@ local function refresh_tests_ui()
 
 	if #tests == 0 then
 		current = 1
-		current_test_row = 1
-		current_test_end_row = 1
 	else
 		current = math.max(1, math.min(current, #tests))
 	end
@@ -467,91 +556,230 @@ local function refresh_tests_ui()
 
 	lines = {}
 	line_meta = {}
-	current_test_row = 1
-	current_test_end_row = 1
+	test_layouts = {}
 
 	for i, test in ipairs(tests) do
-		local test_start_row = #lines + 1
-		if i == current then
-			current_test_row = test_start_row
+		local start_row = #lines + 1
+		local heading = (test.collapsed and "[+]" or "[-]") .. " Test " .. tostring(i)
+		if test.selected then
+			heading = heading .. " [selected]"
 		end
 
-		push_line(align_line("  Test " .. tostring(i), ">", width), {
+		push_test_line(i, heading, {
 			kind = "heading",
 			selected = test.selected,
+			collapsed = test.collapsed,
 		})
-		push_line("status: " .. format_status(test), {
+		push_test_line(i, "status: " .. format_status(test), {
 			kind = "status",
 			status = test.passed,
 		})
-		push_line("time: " .. format_runtime(test), {
+		push_test_line(i, "time: " .. format_runtime(test), {
 			kind = "metric",
 		})
-		push_line("std_input: ", { kind = "label" })
-		append_text_block(test.std_input)
-		push_line("std_output: ", { kind = "label" })
-		append_text_block(test.std_output)
 
-		if test.real_output ~= "" or test.passed ~= STATUS_IDLE then
-			push_line("real_output: ", { kind = "label" })
-			append_text_block(test.real_output)
+		if test.collapsed then
+			push_test_line(i, build_preview("input", test.std_input, width), { kind = "preview" })
+			push_test_line(i, build_preview("expected", test.std_output, width), { kind = "preview" })
+
+			if test.real_output ~= "" or test.passed ~= STATUS_IDLE then
+				push_test_line(i, build_preview("output", test.real_output, width), { kind = "preview" })
+			end
+		else
+			append_labeled_block(i, "input", test.std_input)
+			append_labeled_block(i, "expected", test.std_output)
+
+			if test.real_output ~= "" or test.passed ~= STATUS_IDLE then
+				append_labeled_block(i, "output", test.real_output)
+			end
 		end
 
-		if i == current then
-			current_test_end_row = #lines
+		if i < #tests then
+			push_test_line(i, "", { kind = "separator" })
 		end
+
+		test_layouts[i] = {
+			start_row = start_row,
+			header_row = start_row,
+			end_row = #lines,
+		}
 	end
 
 	set_tests_winbar()
 end
 
-local function focus_current_test()
-	if #tests == 0 then
-		return
-	end
-	if not (win and vim.api.nvim_win_is_valid(win)) then
-		return
-	end
+local function update_current_test_highlight()
 	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
 		return
 	end
 
-	local row = current_test_row
-	local end_row = current_test_end_row
-	local height = math.max(1, vim.api.nvim_win_get_height(win))
-	local block_height = end_row - row + 1
-
 	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
-	for line = row, end_row do
-		vim.api.nvim_buf_set_extmark(buf, highlight_ns, line - 1, 0, {
-			line_hl_group = "CphCurrentTest",
-		})
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	local layout = test_layouts[current]
+	if not layout then
+		return
+	end
+
+	vim.api.nvim_buf_set_extmark(buf, highlight_ns, layout.header_row - 1, 0, {
+		line_hl_group = "CphCurrentTest",
+		priority = 250,
+	})
+end
+
+local function move_cursor_to_row(row, preferred_topline)
+	if not (win and vim.api.nvim_win_is_valid(win)) then
+		return
 	end
 
 	pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
 	pcall(vim.api.nvim_win_call, win, function()
+		local height = math.max(1, vim.api.nvim_win_get_height(win))
 		local view = vim.fn.winsaveview()
-		local topline = view.topline
+		local topline = preferred_topline or view.topline
 		local bottomline = topline + height - 1
-		local target_topline = topline
 
-		if block_height <= height then
-			if row < topline then
-				target_topline = row
-			elseif end_row > bottomline then
-				target_topline = end_row - height + 1
-			end
-		elseif row < topline or row > bottomline then
-			target_topline = row
+		if row < topline then
+			topline = math.max(1, row - 1)
+		elseif row > bottomline then
+			topline = math.max(1, row - height + 1)
 		end
 
 		vim.fn.winrestview({
 			lnum = row,
 			col = 0,
-			topline = math.max(1, target_topline),
+			topline = topline,
 			leftcol = 0,
 		})
 	end)
+end
+
+local function capture_cursor_state()
+	if not (win and vim.api.nvim_win_is_valid(win)) then
+		return nil
+	end
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return nil
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(win)
+	local row = cursor[1]
+	local meta = line_meta[row] or {}
+	local state = {
+		test_index = meta.test_index or current,
+		offset = 0,
+		view = vim.api.nvim_win_call(win, function()
+			return vim.fn.winsaveview()
+		end),
+	}
+	local layout = meta.test_index and test_layouts[meta.test_index]
+
+	if layout then
+		state.offset = row - layout.start_row
+	end
+
+	return state
+end
+
+local function restore_cursor_state(state)
+	if not in_tests_ui or #tests == 0 then
+		update_current_test_highlight()
+		return
+	end
+
+	if state and state.test_index then
+		current = math.max(1, math.min(state.test_index, #tests))
+	end
+
+	local layout = test_layouts[current]
+	if not layout then
+		update_current_test_highlight()
+		return
+	end
+
+	local row = layout.header_row
+	if state and tests[current] and not tests[current].collapsed then
+		row = layout.start_row + (state.offset or 0)
+		row = math.max(layout.start_row, math.min(row, layout.end_row))
+	end
+
+	local topline = state and state.view and state.view.topline or nil
+	move_cursor_to_row(row, topline)
+	set_tests_winbar()
+	update_current_test_highlight()
+end
+
+local function sync_current_from_cursor()
+	if not in_tests_ui or #tests == 0 then
+		update_current_test_highlight()
+		return
+	end
+	if not (win and vim.api.nvim_win_is_valid(win)) then
+		return
+	end
+
+	local row = vim.api.nvim_win_get_cursor(win)[1]
+	local meta = line_meta[row] or {}
+	if meta.test_index then
+		current = meta.test_index
+	end
+
+	set_tests_winbar()
+	update_current_test_highlight()
+end
+
+local function jump_to_test(index)
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	current = math.max(1, math.min(index, #tests))
+	local layout = test_layouts[current]
+
+	if layout then
+		move_cursor_to_row(layout.header_row)
+	end
+
+	set_tests_winbar()
+	update_current_test_highlight()
+end
+
+local function toggle_current_fold()
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	local test = tests[current]
+	if not test then
+		return
+	end
+
+	test.collapsed = not test.collapsed
+	write_tests()
+	M.render()
+end
+
+local function set_all_tests_collapsed(collapsed)
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	local changed = false
+	for _, test in ipairs(tests) do
+		if test.collapsed ~= collapsed then
+			test.collapsed = collapsed
+			changed = true
+		end
+	end
+
+	if not changed then
+		return
+	end
+
+	write_tests()
+	M.render()
 end
 
 local function set_create_ui()
@@ -816,11 +1044,11 @@ local function set_keymaps()
 	end, { buffer = buf, silent = true })
 
 	vim.keymap.set("n", "i", function()
-		open_edit_popup("std_input", "Edit std_input")
+		open_edit_popup("std_input", "Edit input")
 	end, { buffer = buf, silent = true })
 
 	vim.keymap.set("n", "o", function()
-		open_edit_popup("std_output", "Edit std_output")
+		open_edit_popup("std_output", "Edit expected output")
 	end, { buffer = buf, silent = true })
 
 	vim.keymap.set("n", "d", function()
@@ -845,8 +1073,15 @@ local function set_keymaps()
 		M.refresh()
 	end, { buffer = buf, silent = true })
 
-	map_multi("n", { "j", "<Down>" }, M.next_test, { buffer = buf, silent = true })
-	map_multi("n", { "k", "<Up>" }, M.last_test, { buffer = buf, silent = true })
+	map_multi("n", { "<Tab>", "za" }, toggle_current_fold, { buffer = buf, silent = true })
+	vim.keymap.set("n", "zM", function()
+		set_all_tests_collapsed(true)
+	end, { buffer = buf, silent = true })
+	vim.keymap.set("n", "zR", function()
+		set_all_tests_collapsed(false)
+	end, { buffer = buf, silent = true })
+	map_multi("n", { "]t", "]]" }, M.next_test, { buffer = buf, silent = true })
+	map_multi("n", { "[t", "[[" }, M.last_test, { buffer = buf, silent = true })
 end
 
 local function ensure_buf()
@@ -860,6 +1095,14 @@ local function ensure_buf()
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].filetype = "cph-tree"
 
+	vim.api.nvim_create_autocmd("CursorMoved", {
+		group = popup_group,
+		buffer = buf,
+		callback = function()
+			sync_current_from_cursor()
+		end,
+	})
+
 	set_keymaps()
 
 	return buf
@@ -868,6 +1111,8 @@ end
 function M.render()
 	ensure_buf()
 
+	local cursor_state = capture_cursor_state()
+
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
 	vim.api.nvim_buf_clear_namespace(buf, decor_ns, 0, -1)
@@ -875,9 +1120,7 @@ function M.render()
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
 	apply_decorations()
-	if in_tests_ui and #tests > 0 then
-		vim.schedule(focus_current_test)
-	end
+	restore_cursor_state(cursor_state)
 end
 
 function M.refresh()
@@ -909,7 +1152,10 @@ function M.open()
 	vim.wo[win].relativenumber = false
 	vim.wo[win].signcolumn = "no"
 	vim.wo[win].foldcolumn = "0"
-	vim.wo[win].wrap = false
+	vim.wo[win].wrap = true
+	vim.wo[win].linebreak = true
+	vim.wo[win].breakindent = true
+	vim.wo[win].showbreak = "  "
 	vim.wo[win].cursorline = true
 	vim.wo[win].winfixwidth = true
 	vim.wo[win].statuscolumn = ""
@@ -936,15 +1182,13 @@ end
 
 function M.next_test()
 	if in_tests_ui and current < #tests then
-		current = current + 1
-		M.render()
+		jump_to_test(current + 1)
 	end
 end
 
 function M.last_test()
 	if in_tests_ui and current > 1 then
-		current = current - 1
-		M.render()
+		jump_to_test(current - 1)
 	end
 end
 

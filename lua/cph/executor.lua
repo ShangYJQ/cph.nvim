@@ -21,6 +21,24 @@ local function normalize_text(text)
 	return text
 end
 
+local function normalize_expected_text(text)
+	local normalized = {}
+
+	for _, line in ipairs(vim.split(normalize_text(text), "\n", {
+		plain = true,
+		trimempty = false,
+	})) do
+		line = line:gsub("%s+", " ")
+		line = vim.trim(line)
+
+		if line ~= "" then
+			normalized[#normalized + 1] = line
+		end
+	end
+
+	return table.concat(normalized, "\n")
+end
+
 local function split_args(raw)
 	if type(raw) ~= "string" or raw == "" then
 		return {}
@@ -125,8 +143,9 @@ local function run_single_test(binary_path, test, callback)
 	}, function(result)
 		local runtime_ms = math.floor((vim.uv.hrtime() - start) / 1000000 + 0.5)
 		local stdout = normalize_text(result.stdout)
+		local normalized_stdout = normalize_expected_text(stdout)
 		local stderr = normalize_text(result.stderr)
-		local real_output = stdout ~= "" and stdout or stderr
+		local real_output = stdout ~= "" and normalized_stdout or stderr
 
 		if result.code == 124 and real_output == "" then
 			real_output = "Time limit exceeded"
@@ -134,7 +153,10 @@ local function run_single_test(binary_path, test, callback)
 
 		emit(callback, {
 			real_output = real_output,
-			passed = result.code == 0 and stdout == normalize_text(test.std_output) and STATUS_PASS or STATUS_FAILED,
+			passed = result.code == 0
+				and normalized_stdout == normalize_expected_text(test.std_output)
+				and STATUS_PASS
+				or STATUS_FAILED,
 			runtime_ms = runtime_ms,
 			exit_code = result.code,
 			signal = result.signal,
