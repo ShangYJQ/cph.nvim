@@ -68,7 +68,8 @@ function M.setup(opts)
 	})
 
 	vim.validate({
-		timeout = { options.run.timeout, "number" },
+		time_limit = { options.run.time_limit, "number" },
+		memory_limit = { options.run.memory_limit, "number" }
 	})
 
 	M.opts = options

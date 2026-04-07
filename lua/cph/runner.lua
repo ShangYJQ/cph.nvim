@@ -4,12 +4,16 @@
 ---@field real_output string
 ---@field time_limit integer
 ---@field mem_limit integer
+---@field passed string
 
 
 local M = {
 
 
 }
+
+local highlight_ns = vim.api.nvim_create_namespace("cph-runner-highlight")
+local decor_ns = vim.api.nvim_create_namespace("cph-runner-decor")
 
 ---@type integer
 local buf = nil
@@ -21,13 +25,17 @@ local lines = {}
 
 ---@type CPHtest[]
 local tests = {}
----@type string[]
-local passed = {}
 
 ---@type integer
 local current = 1
+---@type integer
+local current_test_row = 1
+---@type integer
+local current_test_end_row = 1
 ---@type string
 local file_path = ""
+---@type string
+local ui_file_path = ""
 local in_create_ui = false
 local in_tests_ui = false
 
@@ -50,42 +58,181 @@ end
 
 local function write_tests()
 	local cph_dir = vim.fn.fnamemodify(get_tests_path(), ":h")
+	local persisted = {}
+
+	for _, test in ipairs(tests) do
+		persisted[#persisted + 1] = {
+			std_input = test.std_input,
+			std_output = test.std_output,
+			time_limit = test.time_limit,
+			mem_limit = test.mem_limit,
+		}
+	end
+
 	vim.fn.mkdir(cph_dir, "p")
-	vim.fn.writefile({ vim.json.encode(tests) }, get_tests_path())
+	vim.fn.writefile({ vim.json.encode(persisted) }, get_tests_path())
 end
 
 local function creat_tests()
-	tests = {}
-	table.insert(tests, {
-		std_input = "",
-		std_output = "",
-		real_output = "",
-		time_limit = get_config().run.time_limit,
-		mem_limit = get_config().run.memory_limit,
-	})
+	tests = {
+		{
+			std_input = "",
+			std_output = "",
+			real_output = "",
+			time_limit = get_config().run.time_limit,
+			mem_limit = get_config().run.memory_limit,
+			passed = "",
+		},
+	}
 
 	write_tests()
+end
+
+local function align_line(left, right, width)
+	local pad = width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(right)
+	return left .. string.rep(" ", math.max(1, pad)) .. right
+end
+
+local function apply_decorations()
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return
+	end
+
+	vim.api.nvim_buf_clear_namespace(buf, decor_ns, 0, -1)
+
+	if #lines == 0 then
+		return
+	end
+
+	for i, line in ipairs(lines) do
+		local row = i - 1
+		local function add_decoration(hl_group, col_start, col_end)
+			col_start = math.max(0, col_start)
+			if col_end < 0 then
+				col_end = #line
+			end
+			col_end = math.max(col_start, math.min(col_end, #line))
+
+			vim.api.nvim_buf_set_extmark(buf, decor_ns, row, col_start, {
+				end_col = col_end,
+				hl_group = hl_group,
+			})
+		end
+
+		if line:match("^File: ") then
+			add_decoration("CphTitle", 0, -1)
+		elseif line:match("^Test %d+") then
+			add_decoration("CphHeading", 0, -1)
+
+			if line:sub(-1) == ">" then
+				add_decoration("CphAccent", #line - 1, #line)
+			end
+		elseif line == "std_input: " or line == "std_output: " or line == "real_output: " then
+			add_decoration("CphLabel", 0, -1)
+		elseif not in_tests_ui and line ~= "" then
+			add_decoration("CphMuted", 0, -1)
+		end
+	end
 end
 
 local function get_tests()
 	local tests_path = get_tests_path()
 	local content = table.concat(vim.fn.readfile(tests_path), "\n")
-	tests = vim.json.decode(content)
+	local decoded = vim.json.decode(content) or {}
+
+	tests = {}
+	for _, test in ipairs(decoded) do
+		test.real_output = test.real_output or ""
+		test.passed = test.passed or ""
+		tests[#tests + 1] = test
+	end
 end
 
 local function set_tests_ui()
-	get_tests()
-	lines[1] = "File: " .. vim.fn.fnamemodify(file_path, ":t")
-	lines[2] = " "
-	for i, _ in ipairs(tests) do
-		local status = passed[i] or ""
-		lines[#lines + 1] = "Test " .. tostring(i) .. "\t" .. status
+	local passed = 0;
+	local width = win and vim.api.nvim_win_is_valid(win)
+		and vim.api.nvim_win_get_width(win)
+		or get_config().window.width
+
+	lines[1] = ""
+	lines[2] = ""
+	current_test_row = 1
+	current_test_end_row = 1
+	for i, test in ipairs(tests) do
+		local test_start_row = #lines + 1
+		if i == current then
+			current_test_row = test_start_row
+		end
+		lines[#lines + 1] = align_line("Test " .. tostring(i) .. "\t", ">", width)
+		if test.passed == "pass" then
+			passed = passed + 1
+		end
+		lines[#lines + 1] = "std_input: "
+		lines[#lines + 1] = test.std_input
+		lines[#lines + 1] = "std_output: "
+		lines[#lines + 1] = test.std_output
+		if test.real_output ~= "" then
+			lines[#lines + 1] = "real_output: "
+			lines[#lines + 1] = test.real_output
+		end
+		if i == current then
+			current_test_end_row = #lines
+		end
 	end
+	lines[1] = align_line(
+		"File: " .. vim.fn.fnamemodify(file_path, ":t"),
+		string.format("%d/%d passed", passed, #tests),
+		width
+	)
+end
+
+local function refresh_tests_ui()
+	get_tests()
+
+	if #tests == 0 then
+		current = 1
+		current_test_row = 1
+		current_test_end_row = 1
+	else
+		current = math.max(1, math.min(current, #tests))
+	end
+
+	set_tests_ui()
+
+	if #tests == 0 then
+		return
+	end
+
+	if not (win and vim.api.nvim_win_is_valid(win)) then
+		return
+	end
+
+	local row = current_test_row
+	local end_row = current_test_end_row
+	vim.schedule(function()
+		if not (win and vim.api.nvim_win_is_valid(win)) then
+			return
+		end
+
+		if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+			return
+		end
+
+		vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
+		for line = row, end_row do
+			vim.api.nvim_buf_set_extmark(buf, highlight_ns, line - 1, 0, {
+				line_hl_group = "CphCurrentTest",
+			})
+		end
+
+		pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
+	end)
 end
 
 local function set_creat_ui()
 	lines = (function()
 		local prompts = {
+			"File: " .. vim.fn.fnamemodify(file_path, ":t"),
 			"当前文件还没有创建 cph",
 			"按下 c 创建",
 		}
@@ -143,17 +290,26 @@ local function build_lines()
 	local type = vim.uv.fs_stat(file_path)
 
 	if not type or type.type == "directory" then
+		ui_file_path = file_path
 		in_create_ui = false
 		in_tests_ui  = false
 		set_welcome()
-	elseif not cph_exits() then
-		in_tests_ui  = false
-		in_create_ui = true
-		set_creat_ui()
 	else
-		in_create_ui = false
-		in_tests_ui = true
-		set_tests_ui()
+		if ui_file_path ~= file_path then
+			ui_file_path = file_path
+			in_create_ui = false
+			in_tests_ui = false
+		end
+
+		if in_tests_ui or cph_exits() then
+			in_create_ui = false
+			in_tests_ui = true
+			refresh_tests_ui()
+		else
+			in_tests_ui = false
+			in_create_ui = true
+			set_creat_ui()
+		end
 	end
 end
 
@@ -209,9 +365,12 @@ function M.render()
 	ensure_buf()
 
 	vim.bo[buf].modifiable = true
+	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
+	vim.api.nvim_buf_clear_namespace(buf, decor_ns, 0, -1)
 	build_lines()
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
+	apply_decorations()
 end
 
 function M.refresh()
@@ -270,12 +429,14 @@ end
 function M.next_test()
 	if in_tests_ui and current < #tests then
 		current = current + 1
+		M.render()
 	end
 end
 
 function M.last_test()
-	if in_tests_ui and current > 2 then
+	if in_tests_ui and current > 1 then
 		current = current - 1
+		M.render()
 	end
 end
 
