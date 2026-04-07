@@ -5,22 +5,27 @@
 ---@field time_limit integer
 ---@field mem_limit integer
 ---@field passed string
+---@field selected boolean
 
 
-local M = {
-
-
-}
+local M = {}
 
 local highlight_ns = vim.api.nvim_create_namespace("cph-runner-highlight")
 local decor_ns = vim.api.nvim_create_namespace("cph-runner-decor")
+local popup_group = vim.api.nvim_create_augroup("CphRunnerPopup", { clear = true })
 
 ---@type integer
 local buf = nil
 local win = nil
+local edit_buf = nil
+local edit_win = nil
+local edit_sync_pending = false
 
 
 local lines = {}
+local selected_test_rows = {}
+local selected_test_indexes = {}
+local selected_count = 0
 
 
 ---@type CPHtest[]
@@ -66,11 +71,24 @@ local function write_tests()
 			std_output = test.std_output,
 			time_limit = test.time_limit,
 			mem_limit = test.mem_limit,
+			selected = test.selected,
 		}
 	end
 
 	vim.fn.mkdir(cph_dir, "p")
 	vim.fn.writefile({ vim.json.encode(persisted) }, get_tests_path())
+end
+
+local function rebuild_selected_state()
+	selected_count = 0
+	selected_test_indexes = {}
+
+	for i, test in ipairs(tests) do
+		if test.selected then
+			selected_count = selected_count + 1
+			selected_test_indexes[#selected_test_indexes + 1] = i
+		end
+	end
 end
 
 local function creat_tests()
@@ -82,15 +100,186 @@ local function creat_tests()
 			time_limit = get_config().run.time_limit,
 			mem_limit = get_config().run.memory_limit,
 			passed = "",
+			selected = false,
 		},
 	}
+	selected_count = 0
+	selected_test_indexes = {}
 
 	write_tests()
+end
+
+local function del_test(i)
+	table.remove(tests, i)
+	rebuild_selected_state()
+end
+
+local function add_test()
+	tests[#tests + 1] = {
+		std_input = "",
+		std_output = "",
+		real_output = "",
+		time_limit = get_config().run.time_limit,
+		mem_limit = get_config().run.memory_limit,
+		passed = "",
+		selected = false,
+	}
+	write_tests()
+	M.refresh()
 end
 
 local function align_line(left, right, width)
 	local pad = width - vim.fn.strdisplaywidth(left) - vim.fn.strdisplaywidth(right)
 	return left .. string.rep(" ", math.max(1, pad)) .. right
+end
+
+local function escape_statusline(text)
+	return text:gsub("%%", "%%%%")
+end
+
+local function split_text(text)
+	if text == "" then
+		return { "" }
+	end
+
+	return vim.split(text, "\n", { plain = true, trimempty = false })
+end
+
+local function join_lines(input_lines)
+	return table.concat(input_lines, "\n")
+end
+
+local function append_text_lines(target, text)
+	for _, line in ipairs(split_text(text or "")) do
+		target[#target + 1] = line
+	end
+end
+
+local function set_winbar(content)
+	if win and vim.api.nvim_win_is_valid(win) then
+		vim.wo[win].winbar = content
+	end
+end
+
+local function clear_winbar()
+	set_winbar("")
+end
+
+local function set_tests_winbar(selected_count)
+	local title = "File: " .. vim.fn.fnamemodify(file_path, ":t")
+	local summary = string.format("%d selected", selected_count)
+	set_winbar(
+		"%#CphTitle#" .. escape_statusline(title)
+		.. "%="
+		.. "%#CphSelected#" .. escape_statusline(summary)
+		.. "%*"
+	)
+end
+
+local function close_edit_popup()
+	if edit_win and vim.api.nvim_win_is_valid(edit_win) then
+		vim.api.nvim_win_close(edit_win, true)
+	end
+
+	edit_win = nil
+	edit_buf = nil
+	edit_sync_pending = false
+end
+
+local function sync_edit_popup(field, close_after_save)
+	if not (edit_buf and vim.api.nvim_buf_is_valid(edit_buf)) then
+		return
+	end
+
+	local test = tests[current]
+	if not test then
+		close_edit_popup()
+		return
+	end
+
+	test[field] = join_lines(vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false))
+	write_tests()
+	M.refresh()
+	if close_after_save then
+		close_edit_popup()
+		if win and vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_set_current_win(win)
+		end
+	elseif edit_win and vim.api.nvim_win_is_valid(edit_win) then
+		vim.api.nvim_set_current_win(edit_win)
+	end
+end
+
+local function open_edit_popup(field, title)
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	local test = tests[current]
+	if not test then
+		return
+	end
+
+	close_edit_popup()
+
+	local content_lines = split_text(test[field] or "")
+	local width = math.max(40, math.min(vim.o.columns - 8, 80))
+	local height = math.max(8, math.min(vim.o.lines - 6, #content_lines + 2))
+
+	edit_buf = vim.api.nvim_create_buf(false, true)
+	vim.b[edit_buf].cph_popup = true
+	vim.bo[edit_buf].buftype = "nofile"
+	vim.bo[edit_buf].bufhidden = "wipe"
+	vim.bo[edit_buf].swapfile = false
+	vim.bo[edit_buf].filetype = "text"
+
+	vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, content_lines)
+
+	edit_win = vim.api.nvim_open_win(edit_buf, true, {
+		relative = "editor",
+		row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+		col = math.floor((vim.o.columns - width) / 2),
+		width = width,
+		height = height,
+		style = "minimal",
+		border = "rounded",
+		title = " " .. title .. " ",
+		title_pos = "center",
+	})
+
+	vim.wo[edit_win].wrap = false
+	vim.wo[edit_win].number = false
+	vim.wo[edit_win].relativenumber = false
+	vim.wo[edit_win].signcolumn = "no"
+
+	vim.keymap.set("n", "q", close_edit_popup, { buffer = edit_buf, silent = true })
+	vim.keymap.set("n", "<Esc>", close_edit_popup, { buffer = edit_buf, silent = true })
+
+	vim.api.nvim_create_autocmd("BufWipeout", {
+		group = popup_group,
+		buffer = edit_buf,
+		once = true,
+		callback = function()
+			edit_win = nil
+			edit_buf = nil
+		end,
+	})
+
+	vim.api.nvim_buf_attach(edit_buf, false, {
+		on_lines = function()
+			if edit_sync_pending then
+				return
+			end
+
+			edit_sync_pending = true
+			vim.schedule(function()
+				edit_sync_pending = false
+				sync_edit_popup(field, false)
+			end)
+		end,
+	})
+
+	vim.cmd("startinsert")
 end
 
 local function apply_decorations()
@@ -106,7 +295,7 @@ local function apply_decorations()
 
 	for i, line in ipairs(lines) do
 		local row = i - 1
-		local function add_decoration(hl_group, col_start, col_end)
+		local function add_decoration(hl_group, col_start, col_end, priority)
 			col_start = math.max(0, col_start)
 			if col_end < 0 then
 				col_end = #line
@@ -116,16 +305,18 @@ local function apply_decorations()
 			vim.api.nvim_buf_set_extmark(buf, decor_ns, row, col_start, {
 				end_col = col_end,
 				hl_group = hl_group,
+				priority = priority,
 			})
 		end
 
-		if line:match("^File: ") then
-			add_decoration("CphTitle", 0, -1)
-		elseif line:match("^Test %d+") then
+		if line:match("^  Test %d+") then
 			add_decoration("CphHeading", 0, -1)
+			if selected_test_rows[i] then
+				add_decoration("CphSelectedBlock", 0, 2, 200)
+			end
 
 			if line:sub(-1) == ">" then
-				add_decoration("CphAccent", #line - 1, #line)
+				add_decoration("CphAccent", #line - 1, #line, 200)
 			end
 		elseif line == "std_input: " or line == "std_output: " or line == "real_output: " then
 			add_decoration("CphLabel", 0, -1)
@@ -144,18 +335,20 @@ local function get_tests()
 	for _, test in ipairs(decoded) do
 		test.real_output = test.real_output or ""
 		test.passed = test.passed or ""
+		test.selected = test.selected or false
 		tests[#tests + 1] = test
 	end
+
+	rebuild_selected_state()
 end
 
 local function set_tests_ui()
-	local passed = 0;
 	local width = win and vim.api.nvim_win_is_valid(win)
 		and vim.api.nvim_win_get_width(win)
 		or get_config().window.width
 
-	lines[1] = ""
-	lines[2] = ""
+	lines = {}
+	selected_test_rows = {}
 	current_test_row = 1
 	current_test_end_row = 1
 	for i, test in ipairs(tests) do
@@ -163,27 +356,107 @@ local function set_tests_ui()
 		if i == current then
 			current_test_row = test_start_row
 		end
-		lines[#lines + 1] = align_line("Test " .. tostring(i) .. "\t", ">", width)
-		if test.passed == "pass" then
-			passed = passed + 1
-		end
+		selected_test_rows[test_start_row] = test.selected
+		lines[#lines + 1] = align_line("  Test " .. tostring(i), ">", width)
 		lines[#lines + 1] = "std_input: "
-		lines[#lines + 1] = test.std_input
+		append_text_lines(lines, test.std_input)
 		lines[#lines + 1] = "std_output: "
-		lines[#lines + 1] = test.std_output
+		append_text_lines(lines, test.std_output)
 		if test.real_output ~= "" then
 			lines[#lines + 1] = "real_output: "
-			lines[#lines + 1] = test.real_output
+			append_text_lines(lines, test.real_output)
 		end
 		if i == current then
 			current_test_end_row = #lines
 		end
 	end
-	lines[1] = align_line(
-		"File: " .. vim.fn.fnamemodify(file_path, ":t"),
-		string.format("%d/%d passed", passed, #tests),
-		width
-	)
+
+	set_tests_winbar(selected_count)
+end
+
+local function toggle_selected()
+	if not in_tests_ui or #tests == 0 then
+		return
+	end
+
+	local test = tests[current]
+	if not test then
+		return
+	end
+
+	test.selected = not test.selected
+	if test.selected then
+		selected_count = selected_count + 1
+		selected_test_indexes[#selected_test_indexes + 1] = current
+		table.sort(selected_test_indexes)
+	else
+		selected_count = math.max(0, selected_count - 1)
+		for i = #selected_test_indexes, 1, -1 do
+			if selected_test_indexes[i] == current then
+				table.remove(selected_test_indexes, i)
+				break
+			end
+		end
+	end
+
+	selected_test_rows[current_test_row] = test.selected
+	set_tests_winbar(selected_count)
+	apply_decorations()
+	vim.cmd("redrawstatus")
+	write_tests()
+end
+
+local function focus_current_test()
+	if #tests == 0 then
+		return
+	end
+
+	if not (win and vim.api.nvim_win_is_valid(win)) then
+		return
+	end
+
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return
+	end
+
+	local row = current_test_row
+	local end_row = current_test_end_row
+	local height = math.max(1, vim.api.nvim_win_get_height(win))
+	local block_height = end_row - row + 1
+
+	vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
+	for line = row, end_row do
+		vim.api.nvim_buf_set_extmark(buf, highlight_ns, line - 1, 0, {
+			line_hl_group = "CphCurrentTest",
+		})
+	end
+
+	pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
+	pcall(vim.api.nvim_win_call, win, function()
+		local view = vim.fn.winsaveview()
+		local topline = view.topline
+		local bottomline = topline + height - 1
+		local target_topline = topline
+
+		if block_height <= height then
+			if row < topline then
+				target_topline = row
+			elseif end_row > bottomline then
+				target_topline = end_row - height + 1
+			end
+		else
+			if row < topline or row > bottomline then
+				target_topline = row
+			end
+		end
+
+		vim.fn.winrestview({
+			lnum = row,
+			col = 0,
+			topline = math.max(1, target_topline),
+			leftcol = 0,
+		})
+	end)
 end
 
 local function refresh_tests_ui()
@@ -202,34 +475,13 @@ local function refresh_tests_ui()
 	if #tests == 0 then
 		return
 	end
-
-	if not (win and vim.api.nvim_win_is_valid(win)) then
-		return
-	end
-
-	local row = current_test_row
-	local end_row = current_test_end_row
 	vim.schedule(function()
-		if not (win and vim.api.nvim_win_is_valid(win)) then
-			return
-		end
-
-		if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-			return
-		end
-
-		vim.api.nvim_buf_clear_namespace(buf, highlight_ns, 0, -1)
-		for line = row, end_row do
-			vim.api.nvim_buf_set_extmark(buf, highlight_ns, line - 1, 0, {
-				line_hl_group = "CphCurrentTest",
-			})
-		end
-
-		pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
+		focus_current_test()
 	end)
 end
 
 local function set_creat_ui()
+	clear_winbar()
 	lines = (function()
 		local prompts = {
 			"File: " .. vim.fn.fnamemodify(file_path, ":t"),
@@ -257,6 +509,7 @@ end
 
 
 local function set_welcome()
+	clear_winbar()
 	lines = (function()
 		local art = {
 			"  _____ ____  _   _ ",
@@ -337,6 +590,40 @@ local function set_keymaps()
 	vim.keymap.set("n", "c", function()
 		if in_create_ui then
 			creat_tests()
+			M.refresh()
+		end
+	end, { buffer = buf, silent = true })
+
+	vim.keymap.set("n", "a", function()
+		if in_tests_ui then
+			add_test()
+		end
+	end, { buffer = buf, silent = true })
+
+	vim.keymap.set("n", "<Space>", function()
+		toggle_selected()
+	end, { buffer = buf, silent = true })
+
+	vim.keymap.set("n", "i", function()
+		open_edit_popup("std_input", "Edit std_input")
+	end, { buffer = buf, silent = true })
+
+	vim.keymap.set("n", "o", function()
+		open_edit_popup("std_output", "Edit std_output")
+	end, { buffer = buf, silent = true })
+
+	vim.keymap.set("n", "d", function()
+		if in_tests_ui then
+			if #selected_test_indexes == 0 then
+				del_test(current)
+				write_tests()
+				M.refresh()
+				return
+			end
+			for i = #selected_test_indexes, 1, -1 do
+				del_test(selected_test_indexes[i])
+			end
+			write_tests()
 			M.refresh()
 		end
 	end, { buffer = buf, silent = true })
@@ -444,6 +731,9 @@ function M.setup()
 	vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "TabEnter" }, {
 		group = group,
 		callback = function(args)
+			if vim.b[args.buf].cph_popup then
+				return
+			end
 			if buf ~= args.buf then
 				file_path = vim.api.nvim_buf_get_name(args.buf)
 				M.refresh()
@@ -454,6 +744,9 @@ function M.setup()
 	vim.api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
 		group = group,
 		callback = function(args)
+			if vim.b[args.buf].cph_popup then
+				return
+			end
 			if vim.api.nvim_buf_get_name(args.buf) == file_path then
 				local win_ = vim.api.nvim_get_current_win()
 				file_path = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(win_))
