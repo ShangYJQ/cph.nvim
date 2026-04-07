@@ -12,8 +12,10 @@ local links = {
 	CphSelected = "DiagnosticOk",
 	CphSelectedBlock = "DiffAdd",
 	CphAccent = "Special",
-	CphSuccess = "DiagnosticOk",
-	CphFailure = "DiagnosticError",
+	CphRunning = "DiagnosticWarn",
+	CphPass = "DiagnosticOk",
+	CphFailed = "DiagnosticError",
+	CphMetric = "Special",
 }
 
 function M.apply()

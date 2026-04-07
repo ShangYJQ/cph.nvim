@@ -1,25 +1,24 @@
 local M = {}
 
-
----@class cphRunOpts
+---@class CphRunOpts
 ---@field time_limit integer
 ---@field memory_limit integer
 
----@class cphWinOpts
+---@class CphWindowOpts
 ---@field width integer
 ---@field dir string
 
----@class cphCompileOpt
+---@class CphCompileOpt
 ---@field compiler string
 ---@field arg? string
 
----@class cphOpts
----@field window cphWinOpts
----@field compile table<string, cphCompileOpt>
----@field run? cphRunOpts
+---@class CphOpts
+---@field window CphWindowOpts
+---@field compile table<string, CphCompileOpt>
+---@field run CphRunOpts
 
----@type cphOpts
-local default = {
+---@type CphOpts
+local default_opts = {
 	window = {
 		width = 50,
 		dir = "left",
@@ -27,30 +26,28 @@ local default = {
 	compile = {
 		cpp = {
 			compiler = "clang++",
-			arg = "-O2"
+			arg = "-O2",
 		},
 	},
 	run = {
 		time_limit = 2000,
 		memory_limit = 2048,
-	}
+	},
 }
 
----@type cphOpts
-M.opts = vim.deepcopy(default)
+---@type CphOpts
+M.opts = vim.deepcopy(default_opts)
 
----@param opts? cphOpts
+---@param opts? CphOpts
 function M.setup(opts)
 	opts = opts or {}
 
-
-	local options = vim.tbl_deep_extend("force", vim.deepcopy(default), opts)
-
+	local merged = vim.tbl_deep_extend("force", vim.deepcopy(default_opts), opts)
 	if opts.compile ~= nil then
-		options.compile = opts.compile
+		merged.compile = opts.compile
 	end
 
-	for filetype, item in pairs(options.compile) do
+	for filetype, item in pairs(merged.compile) do
 		if type(filetype) ~= "string" then
 			error("cph.setup(): compile keys must be filetype strings")
 		end
@@ -62,17 +59,17 @@ function M.setup(opts)
 	end
 
 	vim.validate({
-		window = { options.window, "table", true },
-		compile = { options.compile, "table", true },
-		run = { options.run, "table", true }
+		window = { merged.window, "table" },
+		compile = { merged.compile, "table" },
+		run = { merged.run, "table" },
 	})
 
 	vim.validate({
-		time_limit = { options.run.time_limit, "number" },
-		memory_limit = { options.run.memory_limit, "number" }
+		time_limit = { merged.run.time_limit, "number" },
+		memory_limit = { merged.run.memory_limit, "number" },
 	})
 
-	M.opts = options
+	M.opts = merged
 end
 
 function M.get()

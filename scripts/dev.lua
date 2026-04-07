@@ -1,41 +1,50 @@
 local root = vim.fn.getcwd()
+local test_theme_root = root .. "/test/tokyonight.nvim"
 
 vim.opt.rtp:prepend(root)
+if vim.uv.fs_stat(test_theme_root) ~= nil then
+	vim.opt.rtp:prepend(test_theme_root)
+end
+vim.opt.termguicolors = true
+
+local function apply_colorscheme()
+	pcall(vim.cmd.colorscheme, "tokyonight")
+end
+
 local function reload()
 	for name in pairs(package.loaded) do
 		if name == "cph" or name:match("^cph%.") then
 			package.loaded[name] = nil
 		end
 	end
+
 	return require("cph")
 end
 
-vim.g.mapleader = ' '
+vim.g.mapleader = " "
 
 local config = {
 	compile = {
-
 		cpp = {
-			compiler = "g++"
+			compiler = "g++",
 		},
 		c = {
-			compiler = "clang"
-		}
-
+			compiler = "clang",
+		},
 	},
-
 	run = {
-		timeout = 1991,
-	}
-
+		time_limit = 1991,
+	},
 }
 
 vim.api.nvim_create_user_command("DevReload", function()
 	reload().setup(config)
+	apply_colorscheme()
 	vim.notify("cph reloaded")
 end, {})
 
 reload().setup(config)
+apply_colorscheme()
 
 vim.keymap.set("n", "<leader>r", "<cmd>DevReload<CR>")
 vim.keymap.set("n", "<leader>o", "<cmd>ToggleCPH<CR>")

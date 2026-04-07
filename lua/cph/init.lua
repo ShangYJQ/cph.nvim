@@ -1,4 +1,5 @@
 local M = {}
+
 local config = require("cph.config")
 local highlights = require("cph.highlights")
 local runner = require("cph.runner")
