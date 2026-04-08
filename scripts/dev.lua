@@ -35,6 +35,11 @@ local config = {
 	run = {
 		time_limit = 1991,
 	},
+	window = {
+		dir = "floating",
+		width = 100,
+		height = 20,
+	}
 }
 
 vim.api.nvim_create_user_command("DevReload", function()

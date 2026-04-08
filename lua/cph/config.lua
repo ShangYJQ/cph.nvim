@@ -7,6 +7,7 @@ local M = {}
 ---@class CphWindowOpts
 ---@field width integer
 ---@field dir string
+---@field height integer
 
 ---@class CphCompileOpt
 ---@field compiler string
@@ -20,7 +21,8 @@ local M = {}
 ---@type CphOpts
 local default_opts = {
 	window = {
-		width = 50,
+		width = 100,
+		height = 80,
 		dir = "left",
 	},
 	compile = {

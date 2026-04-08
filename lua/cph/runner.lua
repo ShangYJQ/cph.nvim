@@ -23,7 +23,7 @@ local decor_ns = vim.api.nvim_create_namespace("cph-runner-decor")
 local popup_group = vim.api.nvim_create_augroup("CphRunnerPopup", { clear = true })
 local group = vim.api.nvim_create_augroup("CphTrackSource", { clear = true })
 
----@type integer|nil
+---@type integer
 local buf = nil
 local win = nil
 local edit_buf = nil
@@ -49,6 +49,7 @@ local in_create_ui = false
 local in_tests_ui = false
 local run_active = false
 local active_run_file = nil
+local active_run_test_index = nil
 
 local function get_config()
 	return require("cph.config").get()
@@ -115,13 +116,10 @@ local function write_tests_for(target_file_path, items)
 		persisted[#persisted + 1] = {
 			std_input = test.std_input,
 			std_output = test.std_output,
-			real_output = test.real_output,
 			time_limit = test.time_limit,
 			mem_limit = test.mem_limit,
-			passed = test.passed,
 			selected = test.selected,
 			collapsed = test.collapsed,
-			runtime_ms = test.runtime_ms,
 		}
 	end
 
@@ -308,17 +306,25 @@ end
 
 local function set_tests_winbar()
 	local title = "File: " .. vim.fn.fnamemodify(file_path, ":t")
-	local current_summary = #tests > 0 and string.format("%d/%d", current, #tests) or "0/0"
-	local summary = string.format("%s | %d selected", current_summary, selected_count)
+	local passed = 0
+	for _, test in ipairs(tests) do
+		if test.passed == STATUS_PASS then
+			passed = passed + 1
+		end
+	end
+	local ratio = string.format("%d/%d", passed, #tests)
+	local summary = ratio
+	local summary_hl = "CphSelected"
 
-	if is_file_running() then
-		summary = summary .. " | running"
+	if is_file_running() and active_run_test_index then
+		summary = string.format("running on test %d", active_run_test_index)
+		summary_hl = "CphRunning"
 	end
 
 	set_winbar(
 		"%#CphTitle#" .. escape_statusline(title)
 		.. "%="
-		.. "%#CphSelected#" .. escape_statusline(summary)
+		.. "%#" .. summary_hl .. "#" .. escape_statusline(summary)
 		.. "%*"
 	)
 end
@@ -504,20 +510,19 @@ local function apply_decorations()
 				local start_col = selected_start - 1
 				add_decoration("CphSelected", start_col, start_col + #" [selected]" - 1, 200)
 			end
-		elseif meta.kind == "status" then
-			local prefix = "status: "
-			add_decoration("CphLabel", 0, #prefix)
 
-			local group_name = "CphMuted"
-			if meta.status == STATUS_RUNNING then
-				group_name = "CphRunning"
-			elseif meta.status == STATUS_PASS then
-				group_name = "CphPass"
-			elseif meta.status == STATUS_FAILED then
-				group_name = "CphFailed"
+			if meta.status_col then
+				local group_name = "CphMuted"
+				if meta.status == STATUS_RUNNING then
+					group_name = "CphRunning"
+				elseif meta.status == STATUS_PASS then
+					group_name = "CphPass"
+				elseif meta.status == STATUS_FAILED then
+					group_name = "CphFailed"
+				end
+
+				add_decoration(group_name, meta.status_col, meta.status_end_col or -1, 150)
 			end
-
-			add_decoration(group_name, #prefix, -1, 150)
 		elseif meta.kind == "metric" then
 			local prefix_end = line:find(": ", 1, true)
 			if prefix_end then
@@ -541,7 +546,6 @@ local function apply_decorations()
 end
 
 local function refresh_tests_ui()
-	tests = read_tests(file_path)
 	rebuild_selected_state()
 
 	if #tests == 0 then
@@ -564,33 +568,35 @@ local function refresh_tests_ui()
 		if test.selected then
 			heading = heading .. " [selected]"
 		end
+		local status_text = format_status(test)
+		local status_gap = math.max(1, width - vim.fn.strdisplaywidth(heading) - vim.fn.strdisplaywidth(status_text))
+		local heading_line = heading .. string.rep(" ", status_gap) .. status_text
 
-		push_test_line(i, heading, {
+		push_test_line(i, heading_line, {
 			kind = "heading",
 			selected = test.selected,
 			collapsed = test.collapsed,
-		})
-		push_test_line(i, "status: " .. format_status(test), {
-			kind = "status",
 			status = test.passed,
+			status_col = #heading + status_gap,
+			status_end_col = #heading_line,
 		})
 		push_test_line(i, "time: " .. format_runtime(test), {
 			kind = "metric",
 		})
 
 		if test.collapsed then
-			push_test_line(i, build_preview("input", test.std_input, width), { kind = "preview" })
-			push_test_line(i, build_preview("expected", test.std_output, width), { kind = "preview" })
+			push_test_line(i, build_preview("  input", test.std_input, width), { kind = "preview" })
+			push_test_line(i, build_preview("  expected", test.std_output, width), { kind = "preview" })
 
 			if test.real_output ~= "" or test.passed ~= STATUS_IDLE then
-				push_test_line(i, build_preview("output", test.real_output, width), { kind = "preview" })
+				push_test_line(i, build_preview("  output", test.real_output, width), { kind = "preview" })
 			end
 		else
-			append_labeled_block(i, "input", test.std_input)
-			append_labeled_block(i, "expected", test.std_output)
+			append_labeled_block(i, "  input", test.std_input)
+			append_labeled_block(i, "  expected", test.std_output)
 
 			if test.real_output ~= "" or test.passed ~= STATUS_IDLE then
-				append_labeled_block(i, "output", test.real_output)
+				append_labeled_block(i, "  output", test.real_output)
 			end
 		end
 
@@ -793,7 +799,7 @@ local function set_create_ui()
 		"按下 c 创建",
 	}
 	local width = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_width(win) or get_config().window
-	.width
+		.width
 	local height = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_height(win) or #prompts
 	local top_pad = math.max(1, math.floor(height * 0.2))
 
@@ -821,7 +827,7 @@ local function set_welcome()
 		" \\_____|_|   |_| |_|",
 	}
 	local width = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_width(win) or get_config().window
-	.width
+		.width
 	local height = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_height(win) or #art
 	local top_pad = math.max(0, math.floor((height - #art) / 2))
 
@@ -848,7 +854,8 @@ local function build_lines()
 		return
 	end
 
-	if ui_file_path ~= file_path then
+	local file_changed = ui_file_path ~= file_path
+	if file_changed then
 		ui_file_path = file_path
 		in_create_ui = false
 		in_tests_ui = false
@@ -856,6 +863,9 @@ local function build_lines()
 	end
 
 	if in_tests_ui or tests_file_exists(file_path) then
+		if file_changed or not in_tests_ui then
+			tests = read_tests(file_path)
+		end
 		in_create_ui = false
 		in_tests_ui = true
 		refresh_tests_ui()
@@ -867,9 +877,12 @@ local function build_lines()
 	set_create_ui()
 end
 
-local function patch_test(target_file_path, index, patch)
-	local target_tests = read_tests(target_file_path)
-	local target = target_tests[index]
+local function patch_test(target_file_path, index, patch, skip_refresh)
+	if target_file_path ~= file_path then
+		return
+	end
+
+	local target = tests[index]
 	if not target then
 		return
 	end
@@ -878,8 +891,7 @@ local function patch_test(target_file_path, index, patch)
 		target[key] = value
 	end
 
-	write_tests_for(target_file_path, target_tests)
-	if target_file_path == file_path then
+	if not skip_refresh then
 		M.refresh()
 	end
 end
@@ -949,14 +961,16 @@ local function run_tests()
 
 	run_active = true
 	active_run_file = target_file_path
+	active_run_test_index = nil
 
 	for _, item in ipairs(queue) do
 		patch_test(target_file_path, item.index, {
 			real_output = "",
 			passed = STATUS_IDLE,
 			runtime_ms = nil,
-		})
+		}, true)
 	end
+	M.refresh()
 
 	executor.run({
 		file_path = target_file_path,
@@ -967,14 +981,16 @@ local function run_tests()
 					real_output = message,
 					passed = STATUS_FAILED,
 					runtime_ms = nil,
-				})
+				}, true)
 			end
+			M.refresh()
 			vim.notify("cph: compilation failed", vim.log.levels.ERROR)
-		end,
-		on_test_start = function(index)
-			patch_test(target_file_path, index, {
-				real_output = "",
-				passed = STATUS_RUNNING,
+			end,
+			on_test_start = function(index)
+				active_run_test_index = index
+				patch_test(target_file_path, index, {
+					real_output = "",
+					passed = STATUS_RUNNING,
 				runtime_ms = nil,
 			})
 		end,
@@ -984,13 +1000,14 @@ local function run_tests()
 				passed = result.passed,
 				runtime_ms = result.runtime_ms,
 			})
-		end,
-		on_done = function()
-			run_active = false
-			active_run_file = nil
-			if target_file_path == file_path then
-				M.refresh()
-			end
+			end,
+			on_done = function()
+				run_active = false
+				active_run_file = nil
+				active_run_test_index = nil
+				if target_file_path == file_path then
+					M.refresh()
+				end
 		end,
 	})
 end
@@ -1141,11 +1158,22 @@ function M.open()
 	end
 
 	ensure_buf()
-
-	win = vim.api.nvim_open_win(buf, true, {
-		split = config.window.dir,
-		win = -1,
-	})
+	if config.window.dir == "floating" then
+		win = vim.api.nvim_open_win(buf, true, {
+			relative = "win",
+			height = config.window.height,
+			width = config.window.width,
+			row = (vim.o.lines / 2) - (config.window.height / 2),
+			col = (vim.o.columns / 2) - (config.window.width / 2),
+			anchor = "NW",
+			border = "rounded",
+		})
+	else
+		win = vim.api.nvim_open_win(buf, true, {
+			split = config.window.dir,
+			win = -1,
+		})
+	end
 
 	vim.api.nvim_win_set_width(win, config.window.width)
 	vim.wo[win].number = false
